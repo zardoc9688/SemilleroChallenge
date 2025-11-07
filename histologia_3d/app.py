@@ -148,7 +148,7 @@ if 'stack_3d' in st.session_state:
             
             st.plotly_chart(fig, use_container_width=True)
         
-        st.info(f"📊 Dimensiones del volumen: {stack_3d.shape[2]}×{stack_3d.shape[1]}×{stack_3d.shape[0]} píxeles")
+        st.info(f" Dimensiones del volumen: {stack_3d.shape[2]}×{stack_3d.shape[1]}×{stack_3d.shape[0]} píxeles")
     
     # ========== TAB 2: CORTES INTERACTIVOS ==========
     with tab2:
@@ -233,7 +233,7 @@ if 'stack_3d' in st.session_state:
         st.plotly_chart(fig_anim, use_container_width=True)
         
         # Botón de reproducción automática
-        if st.button("▶️ Reproducir secuencia"):
+        if st.button(" Reproducir secuencia"):
             placeholder = st.empty()
             
             for i in range(stack_3d.shape[0]):
@@ -255,7 +255,7 @@ if 'stack_3d' in st.session_state:
 
 else:
     # Mensaje inicial
-    st.info("👈 Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D'")
+    st.info("Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D'")
     
     st.markdown("""
     ###  Cómo funciona:
@@ -273,7 +273,7 @@ else:
     3. Define cuántos cortes quieres apilar
     4. Click en "Generar Visualización 3D"
     
-    ### 📁 Estructura esperada:
+    ###  Estructura esperada:
     ```
     data/
     └── Kather_texture_2016_image_tiles_5000/
@@ -282,4 +282,5 @@ else:
         ├── 03_COMPLEX/
         └── ...
     ```
+
     """)
