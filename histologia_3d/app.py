@@ -13,6 +13,7 @@ st.set_page_config(page_title="Visualizador 3D de Cortes Histológicos", layout=
 st.title("Visualización 3D de Cortes Histológicos")
 st.markdown("### Stack 3D de imágenes histológicas colorrectales")
 
+
 # Sidebar: opciones de carga y rendimiento
 st.sidebar.header("Configuración")
 
@@ -37,11 +38,14 @@ tipo_seleccionado = st.sidebar.selectbox("Tipo de tejido:", tipo_tejido_opciones
 num_imagenes = st.sidebar.slider("Número de cortes (imágenes):", 5, 500, 30, step=5)
 
 # Opciones para manejar memoria y color
-resize_dim = st.sidebar.slider("Downsample (píxeles por lado, 0 = sin cambio):", 0, 512, 150, step=1)
+# Nota: las imágenes de origen tienen como máximo 150×150 px en este dataset.
+resize_dim = st.sidebar.slider("Downsample (píxeles por lado, 0 = sin cambio, max 150):", 0, 150, 150, step=1)
 keep_color_for_slices = st.sidebar.checkbox("Mostrar cortes en color (slices)", value=True)
 # Controles para el renderer GPU
 ray_steps = st.sidebar.slider("Pasos de ray-march (más = smoother, más lento)", 50, 600, 200, step=10)
 ray_alpha = st.sidebar.slider("Alpha de acumulación (0.01-1.0)", 0.01, 1.0, 0.05, step=0.01)
+# Tamaño de visualización para cortes (en píxeles)
+display_size = st.sidebar.slider("Tamaño visualización de cortes (px)", 200, 1200, 600, step=50)
 # Eliminada la opción de volumen en escala de grises: la app renderiza RGB por defecto en el visor GPU
 
 
@@ -68,8 +72,15 @@ def load_stack(path_str: str, tissue: str, n: int, resize: int, keep_color: bool
     for archivo in archivos:
         try:
             img = Image.open(archivo).convert("RGB")
+            # El dataset tiene una resolución máxima nativa de 150x150.
+            # Si el usuario solicita un resize mayor, lo limitamos a 150 para evitar
+            # generar resoluciones inexistentes y desperdiciar memoria.
             if resize and resize > 0:
-                img = img.resize((resize, resize), Image.LANCZOS)
+                target_r = min(int(resize), 150)
+                if target_r != resize:
+                    # opcional: podríamos informar al usuario; por ahora simplemente capear
+                    pass
+                img = img.resize((target_r, target_r), Image.LANCZOS)
             arr = np.asarray(img, dtype=np.uint8)
 
             # Calcular luminancia (más eficiente y en uint8)
@@ -298,34 +309,15 @@ def render_rgb_viewer(stack_rgb, height=800, steps=200, alpha=0.05):
         components.html(html, height=height)
 
 
-if st.sidebar.button("Generar Visualización 3D"):
-    st.info(f"Cargando hasta {num_imagenes} imágenes de {tipo_seleccionado}...")
-    stack_gray, stack_rgb, err = load_stack(data_path, tipo_seleccionado, num_imagenes, resize_dim, keep_color_for_slices)
+# Place the main tabs here (after helper definitions) so they render at top but have access to functions/vars
+tab1, tab2, tab3 = st.tabs(["Volumen 3D", "Cortes Interactivos", "Animación"])
 
-    if err:
-        st.error(err)
-    else:
-        st.success(f"Stack cargado: {stack_gray.shape} (Z,Y,X) dtype={stack_gray.dtype}")
-        st.session_state['stack_gray'] = stack_gray
-        st.session_state['stack_rgb'] = stack_rgb
-        st.session_state['tipo'] = tipo_seleccionado
-        st.session_state['resize'] = resize_dim
-        # Mostrar directamente el visor RGB si hay datos RGB cargados
-        if stack_rgb is not None:
-            render_rgb_viewer(stack_rgb, height=800, steps=ray_steps, alpha=ray_alpha)
-        else:
-            st.warning("No se cargaron datos RGB. Asegúrate de habilitar 'Mostrar cortes en color' o que las imágenes sean RGB.")
+with tab1:
+    if 'stack_gray' in st.session_state:
+        stack_gray = st.session_state['stack_gray']
+        stack_rgb = st.session_state.get('stack_rgb', None)
+        tipo = st.session_state.get('tipo', '')
 
-
-if 'stack_gray' in st.session_state:
-    stack_gray = st.session_state['stack_gray']
-    stack_rgb = st.session_state.get('stack_rgb', None)
-    tipo = st.session_state.get('tipo', '')
-
-    tab1, tab2, tab3 = st.tabs(["Volumen 3D", "Cortes Interactivos", "Animación"])
-
-    # TAB 1: Volumen (usamos la versión en gris para menor memoria)
-    with tab1:
         st.header(f"Volumen 3D - {tipo}")
         col1, col2 = st.columns(2)
         with col1:
@@ -333,37 +325,25 @@ if 'stack_gray' in st.session_state:
         with col2:
             num_superficies = st.slider("Nivel de detalle:", 5, 50, 15)
 
-        # El visor RGB (GPU) se muestra automáticamente al generar la visualización.
         if stack_rgb is not None:
-            st.success("Visor RGB disponible: el volumen RGB se mostró al generar la visualización. Usa el botón abajo para reabrirlo.")
-            if st.button("Reabrir visor RGB (GPU)"):
+            st.success("Visor RGB disponible: el visor GPU está listo. Haz click para abrirlo en esta pestaña.")
+            if st.button("Abrir visor RGB (GPU)"):
+                st.session_state['viewer_requested'] = True
+            # Si el usuario solicitó el visor, renderízalo dentro de esta pestaña
+            if st.session_state.get('viewer_requested', False):
                 render_rgb_viewer(stack_rgb, height=800, steps=ray_steps, alpha=ray_alpha)
         else:
             st.info("No hay datos RGB disponibles para el volumen. Asegúrate de habilitar 'Mostrar cortes en color' o que las imágenes sean RGB.")
 
-        # Volumen en escala de grises (opcional, dentro de un expander)
-        with st.expander("Mostrar volumen en escala de grises (opcional)"):
-            with st.spinner("Generando volumen 3D (escala de grises)..."):
-                z, y, x = stack_gray.shape
-                X, Y, Z = np.mgrid[0:x, 0:y, 0:z]
-                fig = go.Figure(data=go.Volume(
-                    x=X.flatten(),
-                    y=Y.flatten(),
-                    z=Z.flatten(),
-                    value=stack_gray.T.flatten(),
-                    isomin=int(stack_gray.min()),
-                    isomax=int(stack_gray.max()),
-                    opacity=opacidad,
-                    surface_count=num_superficies,
-                    colorscale='Viridis',
-                    caps=dict(x_show=False, y_show=False, z_show=False)
-                ))
-                fig.update_layout(scene=dict(aspectmode='data'), height=700)
-                st.plotly_chart(fig, use_container_width=True)
         st.info(f"Dimensiones del volumen (X×Y×Z): {stack_gray.shape[2]}×{stack_gray.shape[1]}×{stack_gray.shape[0]}")
+    else:
+        st.info("Aún no hay un stack cargado. Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D' en la barra lateral.")
 
-    # TAB 2: Cortes interactivos
-    with tab2:
+with tab2:
+    if 'stack_gray' in st.session_state:
+        stack_gray = st.session_state['stack_gray']
+        stack_rgb = st.session_state.get('stack_rgb', None)
+
         st.header("Explorador de Cortes")
         orientacion = st.radio("Plano de corte:", ["Axial (XY)", "Coronal (XZ)", "Sagital (YZ)"], horizontal=True)
 
@@ -391,13 +371,12 @@ if 'stack_gray' in st.session_state:
         st.subheader(titulo)
 
         if keep_color_for_slices and img_color is not None:
-            # Mostrar imagen en color usando Streamlit (más eficiente para RGB)
-            st.image(img_color, clamp=True)
+            # Mostrar la imagen en color escalada al tamaño seleccionado para facilitar la visualización
+            st.image(img_color, clamp=True, width=display_size)
             intensidad_media = float(img_gray.mean())
             intensidad_min = float(img_gray.min())
             intensidad_max = float(img_gray.max())
         else:
-            # Mostrar heatmap en escala de grises
             fig = go.Figure(data=go.Heatmap(z=img_gray, colorscale='Viridis', colorbar=dict(title="Intensidad")))
             fig.update_layout(title=titulo, height=600, xaxis_title='X', yaxis_title='Y')
             st.plotly_chart(fig, use_container_width=True)
@@ -409,33 +388,58 @@ if 'stack_gray' in st.session_state:
         col1.metric("Intensidad Media", f"{intensidad_media:.1f}")
         col2.metric("Intensidad Mín", f"{intensidad_min:.1f}")
         col3.metric("Intensidad Máx", f"{intensidad_max:.1f}")
+    else:
+        st.info("Aún no hay un stack cargado. Genera la visualización 3D desde la barra lateral para explorar cortes.")
 
-    # TAB 3: Animación
-    with tab3:
+with tab3:
+    if 'stack_gray' in st.session_state:
+        stack_gray = st.session_state['stack_gray']
+        stack_rgb = st.session_state.get('stack_rgb', None)
+
         st.header("Animación de Cortes")
         st.info("Navegación secuencial por todos los cortes histológicos")
         frame_idx = st.slider("Frame (corte):", 0, stack_gray.shape[0] - 1, 0, key="animation_slider")
 
         if keep_color_for_slices and stack_rgb is not None:
-            st.image(stack_rgb[frame_idx], clamp=True, caption=f"Corte {frame_idx + 1} de {stack_gray.shape[0]}")
+            st.image(stack_rgb[frame_idx], clamp=True, caption=f"Corte {frame_idx + 1} de {stack_gray.shape[0]}", width=display_size)
         else:
             fig_anim = go.Figure(data=go.Heatmap(z=stack_gray[frame_idx], colorscale='Viridis'))
             fig_anim.update_layout(title=f"Corte {frame_idx + 1} de {stack_gray.shape[0]}", height=600)
             st.plotly_chart(fig_anim, use_container_width=True)
 
-        # Reproducción sencilla (no bloqueante): streamlit rerender controla el slider
         if st.button("Reproducir secuencia"):
             placeholder = st.empty()
             for i in range(stack_gray.shape[0]):
                 if keep_color_for_slices and stack_rgb is not None:
-                    placeholder.image(stack_rgb[i], clamp=True)
+                    placeholder.image(stack_rgb[i], clamp=True, width=display_size)
                 else:
                     fig_seq = go.Figure(data=go.Heatmap(z=stack_gray[i], colorscale='Viridis'))
                     fig_seq.update_layout(height=500)
                     placeholder.plotly_chart(fig_seq, use_container_width=True)
                 st.sleep(0.08)
+    else:
+        st.info("Aún no hay un stack cargado. Genera la visualización 3D desde la barra lateral para ver la animación.")
 
-else:
+if st.sidebar.button("Generar Visualización 3D"):
+    st.info(f"Cargando hasta {num_imagenes} imágenes de {tipo_seleccionado}...")
+    stack_gray, stack_rgb, err = load_stack(data_path, tipo_seleccionado, num_imagenes, resize_dim, keep_color_for_slices)
+
+    if err:
+        st.error(err)
+    else:
+        st.success(f"Stack cargado: {stack_gray.shape} (Z,Y,X) dtype={stack_gray.dtype}")
+        st.session_state['stack_gray'] = stack_gray
+        st.session_state['stack_rgb'] = stack_rgb
+        st.session_state['tipo'] = tipo_seleccionado
+        st.session_state['resize'] = resize_dim
+        # Registrar stack en session_state y marcar que el visor debe mostrarse en la pestaña "Volumen 3D"
+        if stack_rgb is not None:
+            st.session_state['viewer_requested'] = True
+        else:
+            st.warning("No se cargaron datos RGB. Asegúrate de habilitar 'Mostrar cortes en color' o que las imágenes sean RGB.")
+
+
+if 'stack_gray' not in st.session_state:
     st.info("Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D' en la barra lateral.")
     st.markdown(
         """
@@ -444,7 +448,7 @@ else:
     Esta aplicación crea un **stack 3D** apilando múltiples imágenes histológicas del mismo tipo de tejido.
 
     **Características:**
-    - **Volumen 3D**: Visualización volumétrica interactiva (escala de grises)
+    - **Volumen 3D**: Visualización volumétrica interactiva
     - **Cortes**: Explora el volumen en diferentes planos (axial, coronal, sagital)
     - **Animación**: Navega secuencialmente por todos los cortes
 
