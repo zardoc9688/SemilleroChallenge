@@ -2,278 +2,459 @@ import streamlit as st
 import numpy as np
 from PIL import Image
 import plotly.graph_objects as go
+import plotly.express as px
+import base64
+import io
 from pathlib import Path
-import pandas as pd
 
-# Configuración
-st.set_page_config(
-    page_title="Visualizador 3D de Cortes Histológicos",
+# Configuración básica de la página
+st.set_page_config(page_title="Visualizador 3D de Cortes Histológicos", layout="wide")
 
-    layout="wide"
-)
-
-st.title(" Visualización 3D de Cortes Histológicos")
+st.title("Visualización 3D de Cortes Histológicos")
 st.markdown("### Stack 3D de imágenes histológicas colorrectales")
 
-# Sidebar
-st.sidebar.header(" Configuración")
+# Sidebar: opciones de carga y rendimiento
+st.sidebar.header("Configuración")
 
-# Ruta del dataset
 data_path = st.sidebar.text_input(
-    "Ruta del dataset:", 
-    r"C:\Users\juanc\Videos\Semillero\data\Kather_texture_2016_image_tiles_5000"
+    "Ruta del dataset:",
+    r"C:\Users\danie\3D Objects\Proyecto Histologia\data\Kather_texture_2016_image_tiles_5000"
 )
 
-# Selector de tipo de tejido
 tipo_tejido_opciones = [
     "01_TUMOR",
-    "02_STROMA", 
+    "02_STROMA",
     "03_COMPLEX",
     "04_LYMPHO",
     "05_DEBRIS",
     "06_MUCOSA",
     "07_ADIPOSE",
-    "08_EMPTY"
+    "08_EMPTY",
 ]
 
-tipo_seleccionado = st.sidebar.selectbox(
-    "Tipo de tejido:",
-    tipo_tejido_opciones
-)
+tipo_seleccionado = st.sidebar.selectbox("Tipo de tejido:", tipo_tejido_opciones)
 
-# Número de imágenes para el stack
-num_imagenes = st.sidebar.slider(
-    "Número de cortes (imágenes):",
-    min_value=10,
-    max_value=100,
-    value=30,
-    step=5
-)
+num_imagenes = st.sidebar.slider("Número de cortes (imágenes):", 5, 500, 30, step=5)
 
-# Botón para cargar
-if st.sidebar.button(" Generar Visualización 3D", type="primary"):
-    path = Path(data_path) / tipo_seleccionado
-    
+# Opciones para manejar memoria y color
+resize_dim = st.sidebar.slider("Downsample (píxeles por lado, 0 = sin cambio):", 0, 512, 150, step=1)
+keep_color_for_slices = st.sidebar.checkbox("Mostrar cortes en color (slices)", value=True)
+# Controles para el renderer GPU
+ray_steps = st.sidebar.slider("Pasos de ray-march (más = smoother, más lento)", 50, 600, 200, step=10)
+ray_alpha = st.sidebar.slider("Alpha de acumulación (0.01-1.0)", 0.01, 1.0, 0.05, step=0.01)
+# Eliminada la opción de volumen en escala de grises: la app renderiza RGB por defecto en el visor GPU
+
+
+@st.cache_data(show_spinner=False)
+def load_stack(path_str: str, tissue: str, n: int, resize: int, keep_color: bool):
+    """Carga hasta n imágenes de la carpeta, devuelve stack en gris (Z,Y,X,uint8)
+    y opcionalmente stack RGB (Z,Y,X,3,uint8). Se hace resize si resize>0.
+    """
+    path = Path(path_str) / tissue
     if not path.exists():
-        st.error(f" Carpeta no encontrada: {path}")
-    else:
-        st.info(f"Cargando {num_imagenes} cortes histológicos...")
-        
-        # Cargar imágenes
-        imagenes = []
-        archivos = list(path.glob("*.tif"))[:num_imagenes]
-        
-        progress_bar = st.progress(0)
-        
-        for idx, archivo in enumerate(archivos):
-            try:
-                img = Image.open(archivo)
-                img_array = np.array(img)
-                
-                if img_array.shape == (150, 150, 3):
-                    # Convertir a escala de grises para mejor visualización
-                    img_gray = np.mean(img_array, axis=2)
-                    imagenes.append(img_gray)
-                    
-            except Exception as e:
-                continue
-            
-            progress_bar.progress((idx + 1) / len(archivos))
-        
-        progress_bar.empty()
-        
-        if len(imagenes) == 0:
-            st.error(" No se pudieron cargar imágenes")
-        else:
-            # Crear stack 3D
-            stack_3d = np.array(imagenes)
-            st.success(f" Stack 3D creado: {stack_3d.shape}")
-            
-            # Guardar en session state
-            st.session_state['stack_3d'] = stack_3d
-            st.session_state['tipo'] = tipo_seleccionado
+        return None, None, f"Carpeta no encontrada: {path}"
 
-# Mostrar visualización si hay datos
-if 'stack_3d' in st.session_state:
-    stack_3d = st.session_state['stack_3d']
-    tipo = st.session_state['tipo']
-    
-    # Crear tabs
-    tab1, tab2, tab3 = st.tabs([
-        "Volumen 3D",
-        "Cortes Interactivos", 
-        "Animación"
-    ])
-    
-    # ========== TAB 1: VOLUMEN 3D ==========
+    archivos = sorted(path.glob("*.*"))  # aceptar varios formatos
+    # filtrar por extensiones de imagen comunes
+    archivos = [p for p in archivos if p.suffix.lower() in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}]
+    archivos = archivos[:n]
+
+    if len(archivos) == 0:
+        return None, None, "No se encontraron imágenes en la carpeta especificada."
+
+    gray_list = []
+    rgb_list = [] if keep_color else None
+
+    for archivo in archivos:
+        try:
+            img = Image.open(archivo).convert("RGB")
+            if resize and resize > 0:
+                img = img.resize((resize, resize), Image.LANCZOS)
+            arr = np.asarray(img, dtype=np.uint8)
+
+            # Calcular luminancia (más eficiente y en uint8)
+            # Y = 0.2126 R + 0.7152 G + 0.0722 B
+            gray = (0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]).astype(np.uint8)
+            gray_list.append(gray)
+
+            if keep_color:
+                rgb_list.append(arr)
+
+        except Exception as e:
+            # saltar archivos que no se puedan leer
+            continue
+
+    if len(gray_list) == 0:
+        return None, None, "No se pudieron cargar imágenes válidas (tal vez formato o tamaño incompatible)."
+
+    stack_gray = np.stack(gray_list, axis=0).astype(np.uint8)  # Z,Y,X
+    stack_rgb = np.stack(rgb_list, axis=0).astype(np.uint8) if keep_color and rgb_list else None
+
+    return stack_gray, stack_rgb, None
+
+import streamlit.components.v1 as components
+
+
+def render_rgb_viewer(stack_rgb, height=800, steps=200, alpha=0.05):
+        """Genera y muestra el HTML/Three.js que renderiza el volumen RGB usando DataTexture3D.
+        stack_rgb: ndarray Z,Y,X,3 uint8
+        """
+        if stack_rgb is None:
+                st.warning("No hay datos RGB para renderizar.")
+                return
+
+        z_r, y_r, x_r, c = stack_rgb.shape
+        assert c == 3
+        arr = np.ascontiguousarray(stack_rgb)
+        # three.js recent versions expect RGBA (4 components) for 3D textures; convert RGB->RGBA with alpha=255
+        rgba = np.ones((z_r, y_r, x_r, 4), dtype=np.uint8) * 255
+        rgba[..., :3] = arr
+        rgba_arr = np.ascontiguousarray(rgba)
+        b = rgba_arr.tobytes()
+        b64 = base64.b64encode(b).decode('ascii')
+
+        # HTML template with placeholders to avoid f-string brace collisions
+        html_template = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>html,body{{margin:0;height:100%;background:#000;color:#fff}}#container{{width:100%;height:100%}}#status{{position:fixed;left:10px;top:10px;z-index:9999;padding:8px 12px;background:rgba(0,0,0,0.6);border-radius:6px}}</style>
+    </head>
+    <body>
+    <div id="status">Cargando visor...</div>
+    <div id="container"></div>
+    <script>
+    function setStatus(s){
+        const el = document.getElementById('status');
+        if(el) el.textContent = s;
+        console.log('[VOL_VIEWER]', s);
+    }
+    function b64ToUint8Array(b64){
+        const binary = atob(b64);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    async function loadScript(url){
+        return new Promise((resolve, reject)=>{
+            const s = document.createElement('script');
+            s.src = url;
+            s.onload = () => resolve();
+            s.onerror = (e) => reject(new Error('Failed to load ' + url));
+            document.head.appendChild(s);
+        });
+    }
+
+    setStatus('Decodificando datos...');
+    const WIDTH = %%X%%;
+    const HEIGHT = %%Y%%;
+    const DEPTH = %%Z%%;
+    const data = b64ToUint8Array('%%DATA%%');
+    setStatus(`Decoded: ${data.length} bytes (expect ${WIDTH*HEIGHT*DEPTH*4} bytes)`);
+
+    (async ()=>{
+        try{
+            setStatus('Cargando librerías (three.js)...');
+            // cargar three.js y OrbitControls dinámicamente y en orden
+            await loadScript('https://unpkg.com/three@0.146.0/build/three.min.js');
+            setStatus('three.js cargado');
+            await loadScript('https://unpkg.com/three@0.146.0/examples/js/controls/OrbitControls.js');
+            setStatus('OrbitControls cargado');
+
+            setStatus('Creando renderer WebGL...');
+            const container = document.getElementById('container');
+            const renderer = new THREE.WebGLRenderer({antialias:true});
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+            setStatus('Renderer creado');
+
+            const gl = renderer.getContext();
+            const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined') && (gl instanceof WebGL2RenderingContext);
+            setStatus('WebGL2 available: ' + isWebGL2);
+
+            if(!isWebGL2){
+                setStatus('WebGL2 no disponible en este contexto. El visor 3D requiere WebGL2 (DataTexture3D). Abre DevTools para más info.');
+                throw new Error('WebGL2 not available');
+            }
+
+            setStatus('Construyendo escena...');
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+            camera.position.set(0,0,2);
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+            // Crear Data3DTexture (API renombrada en three.js recientes)
+            setStatus('Creando Data3DTexture...');
+            const Texture3DClass = THREE.Data3DTexture || THREE.DataTexture3D;
+            const texture = new Texture3DClass(data, WIDTH, HEIGHT, DEPTH);
+            // recent three.js removed RGBFormat; use RGBA and provide 4 components per voxel
+            texture.format = THREE.RGBAFormat;
+            texture.type = THREE.UnsignedByteType;
+            texture.unpackAlignment = 1;
+            // use linear filtering to smooth slice boundaries (trilinear sampling)
+            texture.magFilter = THREE.LinearFilter;
+            texture.minFilter = THREE.LinearFilter;
+            texture.wrapS = texture.wrapT = texture.wrapR = THREE.ClampToEdgeWrapping;
+            texture.generateMipmaps = false;
+            texture.needsUpdate = true;
+
+            const geometry = new THREE.BoxGeometry(1, HEIGHT/WIDTH, DEPTH/WIDTH);
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_data: { value: texture },
+                    u_size: { value: new THREE.Vector3(WIDTH, HEIGHT, DEPTH) },
+                    u_steps: { value: %%STEPS%% },
+                    u_alpha: { value: %%ALPHA%% }
+                },
+                vertexShader: `
+                    varying vec3 v_position;
+                    void main(){
+                        v_position = position;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+                    precision highp sampler3D;
+                    varying vec3 v_position;
+                    uniform sampler3D u_data;
+                    uniform vec3 u_size;
+                    uniform int u_steps;
+                    uniform float u_alpha;
+
+                    vec2 intersectBox(vec3 orig, vec3 dir){
+                        vec3 boxMin = vec3(-0.5);
+                        vec3 boxMax = vec3(0.5);
+                        vec3 invDir = 1.0 / dir;
+                        vec3 tmin_tmp = (boxMin - orig) * invDir;
+                        vec3 tmax_tmp = (boxMax - orig) * invDir;
+                        vec3 tmin = min(tmin_tmp, tmax_tmp);
+                        vec3 tmax = max(tmin_tmp, tmax_tmp);
+                        float t0 = max(max(tmin.x, tmin.y), tmin.z);
+                        float t1 = min(min(tmax.x, tmax.y), tmax.z);
+                        return vec2(t0, t1);
+                    }
+
+                    void main(){
+                        vec3 rayDir = normalize(v_position - vec3(0.0,0.0,2.0));
+                        vec3 rayOrig = v_position;
+                        vec2 bounds = intersectBox(rayOrig, rayDir);
+                        if(bounds.x > bounds.y) discard;
+                        float t = max(bounds.x, 0.0);
+                        float tEnd = bounds.y;
+                        float dt = (tEnd - t) / float(u_steps);
+                        vec3 accColor = vec3(0.0);
+                        float accAlpha = 0.0;
+                        for(int i=0;i<200;i++){
+                            if(i >= u_steps) break;
+                            vec3 p = rayOrig + (t + dt*float(i)) * rayDir;
+                            vec3 texCoord = p + vec3(0.5);
+                            vec3 col = texture(u_data, texCoord).rgb;
+                            float lumin = (col.r + col.g + col.b) / 3.0;
+                            float alpha = clamp(lumin * u_alpha * 10.0, 0.0, 1.0);
+                            accColor = accColor + (1.0 - accAlpha) * col * alpha;
+                            accAlpha = accAlpha + (1.0 - accAlpha) * alpha;
+                            if(accAlpha >= 0.95) break;
+                        }
+                        gl_FragColor = vec4(accColor, accAlpha);
+                    }
+                `,
+                transparent: true,
+                depthWrite: false
+            });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+
+            function animate(){
+                requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }
+            setStatus('Iniciando animación...');
+            animate();
+
+            window.addEventListener('resize', ()=>{
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                camera.aspect = window.innerWidth/window.innerHeight;
+                camera.updateProjectionMatrix();
+            });
+
+        }catch(err){
+            console.error(err);
+            setStatus('Error al inicializar visor: ' + (err && err.message ? err.message : err));
+        }
+    })();
+
+    </script>
+    </body>
+    </html>
+        '''
+
+        html = html_template.replace('%%X%%', str(x_r)).replace('%%Y%%', str(y_r)).replace('%%Z%%', str(z_r)).replace('%%DATA%%', b64).replace('%%STEPS%%', str(steps)).replace('%%ALPHA%%', str(alpha))
+        components.html(html, height=height)
+
+
+if st.sidebar.button("Generar Visualización 3D"):
+    st.info(f"Cargando hasta {num_imagenes} imágenes de {tipo_seleccionado}...")
+    stack_gray, stack_rgb, err = load_stack(data_path, tipo_seleccionado, num_imagenes, resize_dim, keep_color_for_slices)
+
+    if err:
+        st.error(err)
+    else:
+        st.success(f"Stack cargado: {stack_gray.shape} (Z,Y,X) dtype={stack_gray.dtype}")
+        st.session_state['stack_gray'] = stack_gray
+        st.session_state['stack_rgb'] = stack_rgb
+        st.session_state['tipo'] = tipo_seleccionado
+        st.session_state['resize'] = resize_dim
+        # Mostrar directamente el visor RGB si hay datos RGB cargados
+        if stack_rgb is not None:
+            render_rgb_viewer(stack_rgb, height=800, steps=ray_steps, alpha=ray_alpha)
+        else:
+            st.warning("No se cargaron datos RGB. Asegúrate de habilitar 'Mostrar cortes en color' o que las imágenes sean RGB.")
+
+
+if 'stack_gray' in st.session_state:
+    stack_gray = st.session_state['stack_gray']
+    stack_rgb = st.session_state.get('stack_rgb', None)
+    tipo = st.session_state.get('tipo', '')
+
+    tab1, tab2, tab3 = st.tabs(["Volumen 3D", "Cortes Interactivos", "Animación"])
+
+    # TAB 1: Volumen (usamos la versión en gris para menor memoria)
     with tab1:
         st.header(f"Volumen 3D - {tipo}")
-        
         col1, col2 = st.columns(2)
         with col1:
-            opacidad = st.slider("Opacidad:", 0.01, 0.5, 0.1, 0.01)
+            opacidad = st.slider("Opacidad:", 0.01, 0.8, 0.1, 0.01)
         with col2:
-            num_superficies = st.slider("Nivel de detalle:", 5, 30, 15)
-        
-        with st.spinner("Generando volumen 3D..."):
-            z, y, x = stack_3d.shape
-            
-            # Crear coordenadas
-            X, Y, Z = np.mgrid[0:x, 0:y, 0:z]
-            
-            # Crear figura con volumen
-            fig = go.Figure(data=go.Volume(
-                x=X.flatten(),
-                y=Y.flatten(),
-                z=Z.flatten(),
-                value=stack_3d.T.flatten(),
-                isomin=stack_3d.min(),
-                isomax=stack_3d.max(),
-                opacity=opacidad,
-                surface_count=num_superficies,
-                colorscale='Viridis',
-                caps=dict(x_show=False, y_show=False, z_show=False)
-            ))
-            
-            fig.update_layout(
-                scene=dict(
-                    xaxis_title='X (píxeles)',
-                    yaxis_title='Y (píxeles)',
-                    zaxis_title='Profundidad (cortes)',
-                    aspectmode='data'
-                ),
-                height=700,
-                title=f"Visualización Volumétrica 3D - {tipo}"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        st.info(f" Dimensiones del volumen: {stack_3d.shape[2]}×{stack_3d.shape[1]}×{stack_3d.shape[0]} píxeles")
-    
-    # ========== TAB 2: CORTES INTERACTIVOS ==========
+            num_superficies = st.slider("Nivel de detalle:", 5, 50, 15)
+
+        # El visor RGB (GPU) se muestra automáticamente al generar la visualización.
+        if stack_rgb is not None:
+            st.success("Visor RGB disponible: el volumen RGB se mostró al generar la visualización. Usa el botón abajo para reabrirlo.")
+            if st.button("Reabrir visor RGB (GPU)"):
+                render_rgb_viewer(stack_rgb, height=800, steps=ray_steps, alpha=ray_alpha)
+        else:
+            st.info("No hay datos RGB disponibles para el volumen. Asegúrate de habilitar 'Mostrar cortes en color' o que las imágenes sean RGB.")
+
+        # Volumen en escala de grises (opcional, dentro de un expander)
+        with st.expander("Mostrar volumen en escala de grises (opcional)"):
+            with st.spinner("Generando volumen 3D (escala de grises)..."):
+                z, y, x = stack_gray.shape
+                X, Y, Z = np.mgrid[0:x, 0:y, 0:z]
+                fig = go.Figure(data=go.Volume(
+                    x=X.flatten(),
+                    y=Y.flatten(),
+                    z=Z.flatten(),
+                    value=stack_gray.T.flatten(),
+                    isomin=int(stack_gray.min()),
+                    isomax=int(stack_gray.max()),
+                    opacity=opacidad,
+                    surface_count=num_superficies,
+                    colorscale='Viridis',
+                    caps=dict(x_show=False, y_show=False, z_show=False)
+                ))
+                fig.update_layout(scene=dict(aspectmode='data'), height=700)
+                st.plotly_chart(fig, use_container_width=True)
+        st.info(f"Dimensiones del volumen (X×Y×Z): {stack_gray.shape[2]}×{stack_gray.shape[1]}×{stack_gray.shape[0]}")
+
+    # TAB 2: Cortes interactivos
     with tab2:
         st.header("Explorador de Cortes")
-        
-        # Selector de orientación
-        orientacion = st.radio(
-            "Plano de corte:",
-            ["Axial (XY)", "Coronal (XZ)", "Sagital (YZ)"],
-            horizontal=True
-        )
-        
+        orientacion = st.radio("Plano de corte:", ["Axial (XY)", "Coronal (XZ)", "Sagital (YZ)"], horizontal=True)
+
         if orientacion == "Axial (XY)":
-            max_idx = stack_3d.shape[0] - 1
+            max_idx = stack_gray.shape[0] - 1
             slice_idx = st.slider("Índice de corte:", 0, max_idx, max_idx // 2)
-            img_slice = stack_3d[slice_idx, :, :]
+            img_gray = stack_gray[slice_idx, :, :]
+            img_color = stack_rgb[slice_idx] if stack_rgb is not None else None
             titulo = f"Corte Axial - Profundidad: {slice_idx}/{max_idx}"
-            
+
         elif orientacion == "Coronal (XZ)":
-            max_idx = stack_3d.shape[1] - 1
+            max_idx = stack_gray.shape[1] - 1
             slice_idx = st.slider("Índice de corte:", 0, max_idx, max_idx // 2)
-            img_slice = stack_3d[:, slice_idx, :]
+            img_gray = stack_gray[:, slice_idx, :]
+            img_color = stack_rgb[:, slice_idx, :] if stack_rgb is not None else None
             titulo = f"Corte Coronal - Y: {slice_idx}/{max_idx}"
-            
+
         else:  # Sagital
-            max_idx = stack_3d.shape[2] - 1
+            max_idx = stack_gray.shape[2] - 1
             slice_idx = st.slider("Índice de corte:", 0, max_idx, max_idx // 2)
-            img_slice = stack_3d[:, :, slice_idx]
+            img_gray = stack_gray[:, :, slice_idx]
+            img_color = stack_rgb[:, :, slice_idx] if stack_rgb is not None else None
             titulo = f"Corte Sagital - X: {slice_idx}/{max_idx}"
-        
-        # Mostrar corte
-        fig = go.Figure(data=go.Heatmap(
-            z=img_slice,
-            colorscale='Viridis',
-            colorbar=dict(title="Intensidad")
-        ))
-        
-        fig.update_layout(
-            title=titulo,
-            height=600,
-            xaxis_title='X',
-            yaxis_title='Y'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Mostrar estadísticas del corte
+
+        st.subheader(titulo)
+
+        if keep_color_for_slices and img_color is not None:
+            # Mostrar imagen en color usando Streamlit (más eficiente para RGB)
+            st.image(img_color, clamp=True)
+            intensidad_media = float(img_gray.mean())
+            intensidad_min = float(img_gray.min())
+            intensidad_max = float(img_gray.max())
+        else:
+            # Mostrar heatmap en escala de grises
+            fig = go.Figure(data=go.Heatmap(z=img_gray, colorscale='Viridis', colorbar=dict(title="Intensidad")))
+            fig.update_layout(title=titulo, height=600, xaxis_title='X', yaxis_title='Y')
+            st.plotly_chart(fig, use_container_width=True)
+            intensidad_media = float(img_gray.mean())
+            intensidad_min = float(img_gray.min())
+            intensidad_max = float(img_gray.max())
+
         col1, col2, col3 = st.columns(3)
-        col1.metric("Intensidad Media", f"{np.mean(img_slice):.1f}")
-        col2.metric("Intensidad Mín", f"{np.min(img_slice):.1f}")
-        col3.metric("Intensidad Máx", f"{np.max(img_slice):.1f}")
-    
-    # ========== TAB 3: ANIMACIÓN ==========
+        col1.metric("Intensidad Media", f"{intensidad_media:.1f}")
+        col2.metric("Intensidad Mín", f"{intensidad_min:.1f}")
+        col3.metric("Intensidad Máx", f"{intensidad_max:.1f}")
+
+    # TAB 3: Animación
     with tab3:
         st.header("Animación de Cortes")
-        
-        st.info("📹 Navegación secuencial por todos los cortes histológicos")
-        
-        # Slider de animación
-        frame_idx = st.slider(
-            "Frame (corte):",
-            0,
-            stack_3d.shape[0] - 1,
-            0,
-            key="animation_slider"
-        )
-        
-        # Mostrar frame actual
-        fig_anim = go.Figure(data=go.Heatmap(
-            z=stack_3d[frame_idx, :, :],
-            colorscale='Viridis',
-            colorbar=dict(title="Intensidad")
-        ))
-        
-        fig_anim.update_layout(
-            title=f"Corte {frame_idx + 1} de {stack_3d.shape[0]}",
-            height=600,
-            xaxis_title='X (píxeles)',
-            yaxis_title='Y (píxeles)'
-        )
-        
-        st.plotly_chart(fig_anim, use_container_width=True)
-        
-        # Botón de reproducción automática
-        if st.button(" Reproducir secuencia"):
+        st.info("Navegación secuencial por todos los cortes histológicos")
+        frame_idx = st.slider("Frame (corte):", 0, stack_gray.shape[0] - 1, 0, key="animation_slider")
+
+        if keep_color_for_slices and stack_rgb is not None:
+            st.image(stack_rgb[frame_idx], clamp=True, caption=f"Corte {frame_idx + 1} de {stack_gray.shape[0]}")
+        else:
+            fig_anim = go.Figure(data=go.Heatmap(z=stack_gray[frame_idx], colorscale='Viridis'))
+            fig_anim.update_layout(title=f"Corte {frame_idx + 1} de {stack_gray.shape[0]}", height=600)
+            st.plotly_chart(fig_anim, use_container_width=True)
+
+        # Reproducción sencilla (no bloqueante): streamlit rerender controla el slider
+        if st.button("Reproducir secuencia"):
             placeholder = st.empty()
-            
-            for i in range(stack_3d.shape[0]):
-                fig_seq = go.Figure(data=go.Heatmap(
-                    z=stack_3d[i, :, :],
-                    colorscale='Viridis'
-                ))
-                
-                fig_seq.update_layout(
-                    title=f"Corte {i + 1} de {stack_3d.shape[0]}",
-                    height=500
-                )
-                
-                placeholder.plotly_chart(fig_seq, use_container_width=True)
-                
-                # Pausa entre frames
-                import time
-                time.sleep(0.1)
+            for i in range(stack_gray.shape[0]):
+                if keep_color_for_slices and stack_rgb is not None:
+                    placeholder.image(stack_rgb[i], clamp=True)
+                else:
+                    fig_seq = go.Figure(data=go.Heatmap(z=stack_gray[i], colorscale='Viridis'))
+                    fig_seq.update_layout(height=500)
+                    placeholder.plotly_chart(fig_seq, use_container_width=True)
+                st.sleep(0.08)
 
 else:
-    # Mensaje inicial
-    st.info("Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D'")
-    
-    st.markdown("""
-    ###  Cómo funciona:
-    
+    st.info("Selecciona el tipo de tejido y haz click en 'Generar Visualización 3D' en la barra lateral.")
+    st.markdown(
+        """
+    ### Cómo funciona:
+
     Esta aplicación crea un **stack 3D** apilando múltiples imágenes histológicas del mismo tipo de tejido.
-    
+
     **Características:**
-    -  **Volumen 3D**: Visualización volumétrica interactiva
-    -  **Cortes**: Explora el volumen en diferentes planos (axial, coronal, sagital)
-    -  **Animación**: Navega secuencialmente por todos los cortes
-    
+    - **Volumen 3D**: Visualización volumétrica interactiva (escala de grises)
+    - **Cortes**: Explora el volumen en diferentes planos (axial, coronal, sagital)
+    - **Animación**: Navega secuencialmente por todos los cortes
+
     **Requisitos:**
-    1. Dataset descargado y descomprimido en `data/`
+    1. Dataset descargado y descomprimido en la ruta seleccionada
     2. Selecciona un tipo de tejido
-    3. Define cuántos cortes quieres apilar
+    3. Define cuántos cortes quieres apilar y el downsample si lo necesitas
     4. Click en "Generar Visualización 3D"
-    
-    ###  Estructura esperada:
+
+    ### Estructura esperada:
     ```
     data/
     └── Kather_texture_2016_image_tiles_5000/
@@ -282,5 +463,6 @@ else:
         ├── 03_COMPLEX/
         └── ...
     ```
+    """
+    )
 
-    """)
