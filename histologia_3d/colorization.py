@@ -1,20 +1,35 @@
-"""
-Módulo de Colorización para Imágenes Histológicas
-Implementación basada en FalseColor-Python (Giacomelli et al., 2020)
+"""Utilidades de colorización para la app Streamlit."""
 
-Autores: Daniel Yaruro, Juan Mantilla
-Fecha: Enero 2025
-"""
+from __future__ import annotations
 
-import numpy as np
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
 import cv2
-from typing import Tuple
+import numpy as np
+
+# Intentar enlazar el backend oficial FalseColor-Python
+FALSECOLOR_AVAILABLE = False
+FALSECOLOR_ERROR: Optional[str] = None
+FALSECOLOR_ROOT = Path(__file__).resolve().parent.parent / "falsecolor"
+if FALSECOLOR_ROOT.exists():
+    if str(FALSECOLOR_ROOT) not in sys.path:
+        sys.path.insert(0, str(FALSECOLOR_ROOT))
+
+try:  # pragma: no cover - dependencias externas
+    import falsecolor.coloring as fc  # type: ignore
+
+    FALSECOLOR_AVAILABLE = True
+except Exception as exc:  # pragma: no cover - solo informativo
+    fc = None  # type: ignore
+    FALSECOLOR_ERROR = repr(exc)
 
 class HistologyColorizer:
-    """
-    Aplica pseudo-colorización a imágenes histológicas en escala de grises
-    """
-    
+    """Aplicar colorización simple o FalseColor real."""
+
+    FALSECOLOR_AVAILABLE = FALSECOLOR_AVAILABLE
+
     COLORMAPS = {
         'H&E': 'custom_he',
         'Viridis': cv2.COLORMAP_VIRIDIS,
@@ -23,6 +38,14 @@ class HistologyColorizer:
         'Turbo': cv2.COLORMAP_TURBO,
         'Parula': cv2.COLORMAP_PARULA,
     }
+
+    @staticmethod
+    def has_falsecolor_backend() -> bool:
+        return HistologyColorizer.FALSECOLOR_AVAILABLE
+
+    @staticmethod
+    def falsecolor_error_message() -> Optional[str]:
+        return FALSECOLOR_ERROR
     
     @staticmethod
     def apply_clahe(img: np.ndarray, 
@@ -44,6 +67,18 @@ class HistologyColorizer:
         clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
         return clahe.apply(img)
     
+    @staticmethod
+    def normalize_channel(img: np.ndarray, target_dtype=np.uint8) -> np.ndarray:
+        """Normaliza cualquier imagen a 0-1 y la devuelve como uint."""
+
+        img = img.astype(np.float32)
+        img -= np.nanmin(img)
+        max_val = np.nanmax(img)
+        if max_val > 0:
+            img /= max_val
+        scale = 255.0 if target_dtype == np.uint8 else 65535.0
+        return (img * scale).clip(0, scale).astype(target_dtype)
+
     @staticmethod
     def intensity_leveling(img: np.ndarray,
                           percentile_low: float = 1.0,
@@ -130,3 +165,107 @@ class HistologyColorizer:
             colormap_id = HistologyColorizer.COLORMAPS.get(colormap, cv2.COLORMAP_VIRIDIS)
             colored = cv2.applyColorMap(img_processed, colormap_id)
             return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+
+    # ================= FALSECOLOR-PYTHON BACKEND =================
+    @staticmethod
+    def estimate_background(img: np.ndarray, threshold: float = 50.0) -> float:
+        if HistologyColorizer.FALSECOLOR_AVAILABLE:
+            _, background = fc.getBackgroundLevels(img, threshold=threshold)
+            return float(background)
+        hi = np.percentile(img, 95)
+        return float(hi * 0.2)
+
+    @staticmethod
+    def _prepare_for_falsecolor(img: np.ndarray) -> np.ndarray:
+        arr = np.asarray(img, dtype=np.float32)
+        return np.nan_to_num(arr, nan=0.0)
+
+    @staticmethod
+    def _prepare_for_clahe(img: np.ndarray) -> np.ndarray:
+        return HistologyColorizer.normalize_channel(img, target_dtype=np.uint16)
+
+    @staticmethod
+    def cpu_sharpen(img: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+        """Basic CPU-only sharpening fallback using Laplacian."""
+
+        img_uint8 = HistologyColorizer.normalize_channel(img, target_dtype=np.uint8)
+        lap = cv2.Laplacian(img_uint8, cv2.CV_16S, ksize=3)
+        lap = cv2.convertScaleAbs(lap)
+        sharp = cv2.addWeighted(img_uint8, 1 + alpha, lap, -alpha, 0)
+        return sharp.astype(np.float32)
+
+    @staticmethod
+    def apply_falsecolor_dual(
+        nuclei: np.ndarray,
+        cyto: np.ndarray,
+        *,
+        method: str = 'cpu',
+        nuc_threshold: Optional[float] = None,
+        cyto_threshold: Optional[float] = None,
+        nuc_normfactor: Optional[float] = 5000,
+        cyto_normfactor: Optional[float] = 2000,
+        color_key: str = 'HE',
+        apply_sharpen: bool = False,
+        sharpen_alpha: float = 0.5,
+        apply_clahe: bool = False,
+        clahe_clip: float = 0.05,
+    ) -> np.ndarray:
+        """Colorización real usando FalseColor-Python."""
+
+        if not HistologyColorizer.FALSECOLOR_AVAILABLE:
+            raise RuntimeError("El backend FalseColor no está disponible en este entorno")
+
+        nuclei_f = HistologyColorizer._prepare_for_falsecolor(nuclei)
+        cyto_f = HistologyColorizer._prepare_for_falsecolor(cyto)
+
+        if apply_clahe:
+            nuclei_f = fc.applyCLAHE(
+                HistologyColorizer._prepare_for_clahe(nuclei_f),
+                clipLimit=clahe_clip,
+            ).astype(np.float32)
+            cyto_f = fc.applyCLAHE(
+                HistologyColorizer._prepare_for_clahe(cyto_f),
+                clipLimit=clahe_clip,
+            ).astype(np.float32)
+
+        if apply_sharpen:
+            try:
+                nuclei_f = fc.sharpenImage(nuclei_f, alpha=sharpen_alpha)
+                cyto_f = fc.sharpenImage(cyto_f, alpha=sharpen_alpha)
+            except Exception as err:
+                if "CUDA" in str(err).upper():
+                    nuclei_f = HistologyColorizer.cpu_sharpen(nuclei_f, sharpen_alpha)
+                    cyto_f = HistologyColorizer.cpu_sharpen(cyto_f, sharpen_alpha)
+                else:
+                    raise
+
+        if nuc_threshold is None:
+            nuc_threshold = HistologyColorizer.estimate_background(nuclei_f)
+        if cyto_threshold is None:
+            cyto_threshold = HistologyColorizer.estimate_background(cyto_f)
+
+        color_settings = fc.getColorSettings(key=color_key)
+
+        method = method.lower()
+        if method.startswith('gpu'):
+            pseudo = fc.rapidFalseColor(
+                nuclei_f,
+                cyto_f,
+                color_settings['nuclei'],
+                color_settings['cyto'],
+                nuc_normfactor=nuc_normfactor or 8500,
+                cyto_normfactor=cyto_normfactor or 2000,
+            )
+        else:
+            pseudo = fc.falseColor(
+                nuclei_f,
+                cyto_f,
+                nuc_threshold=nuc_threshold,
+                cyto_threshold=cyto_threshold,
+                nuc_normfactor=nuc_normfactor,
+                cyto_normfactor=cyto_normfactor,
+                color_key=color_key,
+                color_settings=color_settings,
+            )
+
+        return np.asarray(pseudo, dtype=np.uint8)

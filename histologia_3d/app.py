@@ -427,11 +427,12 @@ def render_rgb_viewer(stack_rgb, height=800, steps=200, alpha=0.05):
     components.html(html, height=height)
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     " Volumen 3D", 
     " Cortes Interactivos", 
     " Animación",
-    " Información"
+    " Información",
+    " Colorización FalseColor (H&E)"
 ])
 
 # ========== TAB 1: VOLUMEN 3D ==========
@@ -759,7 +760,163 @@ with tab4:
     
     import pandas as pd
     df_config = pd.DataFrame(config_data)
-    st.dataframe(df_config, use_container_width=True, hide_index=True)
+    # Forzar tipos string para compatibilidad con Arrow
+    df_config = df_config.astype(str)
+    st.dataframe(df_config, width="stretch", hide_index=True)
+
+# ========== TAB 5: COLORIZACIÓN FALSECOLOR (H&E) ==========
+with tab5:
+    st.header("Colorización Virtual H&E desde .h5")
+    st.markdown("""
+    Esta sección usa archivos `.h5` del ejemplo FalseColor para generar una imagen 2D 
+    con tinción virtual H&E a partir de canales de **núcleo (nuclei)** y **citoplasma (cyto)**.
+    """)
+
+    default_h5_path = st.session_state.get(
+        "falsecolor_base_path",
+        r"C:\Users\danie\3D Objects\Proyecto Histologia\code\falsecolor\example\h5_sample_data"
+    )
+    base_h5_path = st.text_input(
+        "Ruta base de los archivos .h5",
+        value=default_h5_path,
+        help="Directorio que contiene subcarpetas como kidney/lung/prostate con archivos .h5."
+    )
+    st.session_state["falsecolor_base_path"] = base_h5_path.strip() or default_h5_path
+    base_h5_path = st.session_state["falsecolor_base_path"]
+
+    backend_error = HistologyColorizer.falsecolor_error_message()
+    if not HistologyColorizer.has_falsecolor_backend():
+        msg = "El backend FalseColor-Python no está disponible. Revisa dependencias (scipy, scikit-image, numba, etc.)."
+        if backend_error:
+            msg += f"\n\nDetalle: {backend_error}"
+        st.error(msg)
+
+    organ = st.selectbox(
+        "Selecciona muestra:",
+        ["kidney", "lung", "prostate", "IHC_data"]
+    )
+
+    col_opts = st.columns(3)
+    with col_opts[0]:
+        he_auto_thresholds = st.checkbox("Threshold automático", value=True)
+        st.caption("Se usa suavizado estándar sin realce de bordes.")
+    with col_opts[1]:
+        he_apply_clahe = st.checkbox("CLAHE (nivelación local)", value=False)
+        if he_apply_clahe:
+            he_clahe_clip = st.slider("Clip CLAHE FalseColor", 0.01, 0.20, 0.05, 0.01)
+        else:
+            he_clahe_clip = 0.05
+    with col_opts[2]:
+        he_method = st.selectbox(
+            "Motor FalseColor",
+            ["CPU (falseColor)", "GPU (rapidFalseColor)"],
+            help="La opción GPU requiere CUDA y puede no estar disponible en todos los equipos",
+        )
+
+    if he_auto_thresholds:
+        nuc_threshold = None
+        cyto_threshold = None
+    else:
+        nuc_threshold = st.slider("Threshold nuclear", 0, 5000, 50, 10)
+        cyto_threshold = st.slider("Threshold citoplasmático", 0, 5000, 50, 10)
+
+    colorize_button = st.button("Generar H&E virtual", type="primary")
+
+    if colorize_button and not HistologyColorizer.has_falsecolor_backend():
+        detail = backend_error or "Dependencias faltantes"
+        st.error("No es posible ejecutar FalseColor sin instalar el paquete completo. "
+                 "Revisa la carpeta `code/falsecolor` e instala requisitos (por ejemplo, `pip install -r code/falsecolor/requirements.txt`)."
+                 f"\n\nDetalle: {detail}")
+    elif colorize_button:
+        import os
+        import h5py as h5
+        import numpy as np
+
+        folder_path = os.path.join(base_h5_path, organ)
+
+        if not os.path.exists(folder_path):
+            st.error(f"No se encontró la carpeta: {folder_path}")
+        else:
+            # Buscar automáticamente el primer archivo .h5 en la carpeta
+            h5_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".h5")]
+
+            if not h5_files:
+                st.error("No se encontraron archivos .h5 en la carpeta seleccionada.")
+            else:
+                file_path = os.path.join(folder_path, h5_files[0])
+
+                try:
+                    with h5.File(file_path, 'r') as f:
+                        nuclei = f['t00000/s00/0/cells'][:]
+                        cyto = f['t00000/s01/0/cells'][:]
+
+                    nuc_img = nuclei[0]
+                    cyto_img = cyto[0]
+
+                    nuc_display = HistologyColorizer.normalize_channel(nuc_img)
+                    cyto_display = HistologyColorizer.normalize_channel(cyto_img)
+
+                    st.subheader("Canales originales (sin colorizar)")
+                    col_raw1, col_raw2 = st.columns(2)
+                    with col_raw1:
+                        st.image(nuc_display, clamp=True, caption="Nuclear (Hematoxilina)", width=display_size)
+                    with col_raw2:
+                        st.image(cyto_display, clamp=True, caption="Citoplásmico (Eosina)", width=display_size)
+
+                    method_key = "gpu" if he_method.startswith("GPU") else "cpu"
+
+                    fallback_used = False
+                    with st.spinner("Aplicando colorización FalseColor..."):
+                        try:
+                            he_img = HistologyColorizer.apply_falsecolor_dual(
+                                nuc_img,
+                                cyto_img,
+                                method=method_key,
+                                nuc_threshold=nuc_threshold,
+                                cyto_threshold=cyto_threshold,
+                                apply_sharpen=False,
+                                apply_clahe=he_apply_clahe,
+                                clahe_clip=he_clahe_clip,
+                            )
+                        except RuntimeError as err:
+                            err_msg = str(err)
+                            if method_key == "gpu" and "CUDA" in err_msg.upper():
+                                fallback_used = True
+                                st.warning("No se encontró un driver CUDA disponible. Se usará automáticamente la versión CPU.")
+                                he_img = HistologyColorizer.apply_falsecolor_dual(
+                                    nuc_img,
+                                    cyto_img,
+                                    method="cpu",
+                                    nuc_threshold=nuc_threshold,
+                                    cyto_threshold=cyto_threshold,
+                                    apply_sharpen=False,
+                                    apply_clahe=he_apply_clahe,
+                                    clahe_clip=he_clahe_clip,
+                                )
+                            else:
+                                raise
+
+                    if he_auto_thresholds:
+                        nuc_bg = HistologyColorizer.estimate_background(nuc_img)
+                        cyto_bg = HistologyColorizer.estimate_background(cyto_img)
+                    else:
+                        nuc_bg = nuc_threshold
+                        cyto_bg = cyto_threshold
+
+                    st.subheader("Resultado: Virtual H&E (2D)")
+                    st.image(he_img, clamp=True, width=display_size)
+
+                    col_bg1, col_bg2 = st.columns(2)
+                    col_bg1.metric("Threshold nuclear", f"{nuc_bg:.2f}")
+                    col_bg2.metric("Threshold citoplasmático", f"{cyto_bg:.2f}")
+
+                    if fallback_used:
+                        st.info("Resultado generado con el motor CPU debido a la falta de drivers CUDA.")
+
+                    st.info(f"Archivo utilizado: {file_path}")
+
+                except Exception as e:
+                    st.error(f"Error al leer o procesar el archivo .h5: {e}")
 
 # ==================== BOTÓN DE CARGA ====================
 st.sidebar.markdown("---")
